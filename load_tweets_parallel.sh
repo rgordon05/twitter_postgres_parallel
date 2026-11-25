@@ -1,18 +1,22 @@
-#!/bin/sh
+#!/bin/bash
+set -e
 
-files=$(find data/*)
-
-echo '================================================================================'
 echo 'load pg_denormalized'
-echo '================================================================================'
-# FIXME: implement this with GNU parallel
+time parallel --jobs 10 --halt soon,fail=1 \
+    sh ./load_denormalized.sh {} ::: data/*.zip
 
-echo '================================================================================'
 echo 'load pg_normalized'
-echo '================================================================================'
-# FIXME: implement this with GNU parallel
+time parallel --jobs 10 --halt soon,fail=1 \
+    python3 -u load_tweets.py \
+    --db 'postgresql+psycopg2://postgres:pass@localhost:21139/postgres' \
+    --inputs {} ::: data/*.zip
 
-echo '================================================================================'
+psql 'postgresql://postgres:pass@localhost:21139/postgres' -v ON_ERROR_STOP=1 \
+    -c 'REFRESH MATERIALIZED VIEW tweet_tags_total;' \
+    -c 'REFRESH MATERIALIZED VIEW tweet_tags_cooccurrence;'
+
 echo 'load pg_normalized_batch'
-echo '================================================================================'
-# FIXME: implement this with GNU parallel
+time parallel --jobs 10 --halt soon,fail=1 \
+    python3 -u load_tweets_batch.py \
+    --db 'postgresql://postgres:pass@localhost:21140/postgres' \
+    --inputs {} ::: data/*.zip

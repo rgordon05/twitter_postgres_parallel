@@ -38,33 +38,6 @@ def remove_nulls(s):
         return s.replace('\x00','\\x00')
 
 
-def get_id_urls(url):
-    '''
-    Given a url, returns the corresponding id in the urls table.
-    If no row exists for the url, then one is inserted automatically.
-    '''
-    sql = sqlalchemy.sql.text('''
-    insert into urls 
-        (url)
-        values
-        (:url)
-    on conflict do nothing
-    returning id_urls
-    ;
-    ''')
-    res = connection.execute(sql,{'url':url}).first()
-    if res is None:
-        sql = sqlalchemy.sql.text('''
-        select id_urls 
-        from urls
-        where
-            url=:url
-        ''')
-        res = connection.execute(sql,{'url':url}).first()
-    id_urls = res[0]
-    return id_urls
-
-
 def batch(iterable, n=1):
     '''
     Group an iterable into batches of size n.
@@ -117,9 +90,9 @@ def _bulk_insert_sql(table, rows):
     if not rows:
         raise ValueError('Must be at least one dictionary in the rows variable')
     else:
-        keys = set(rows[0].keys())
+        keys = list(rows[0])
         for row in rows:
-            if set(row.keys()) != keys:
+            if row.keys() != rows[0].keys():
                 raise ValueError('All dictionaries must contain the same keys')
     sql = (f'''
     INSERT INTO {table}
@@ -206,11 +179,6 @@ def _insert_tweets(connection,input_tweets):
         ########################################
         # insert into the users table
         ########################################
-        if tweet['user']['url'] is None:
-            user_id_urls = None
-        else:
-            user_id_urls = get_id_urls(tweet['user']['url'])
-
         users.append({
             'id_users':tweet['user']['id'],
             'created_at':tweet['user']['created_at'],
@@ -218,7 +186,7 @@ def _insert_tweets(connection,input_tweets):
             'screen_name':remove_nulls(tweet['user']['screen_name']),
             'name':remove_nulls(tweet['user']['name']),
             'location':remove_nulls(tweet['user']['location']),
-            'id_urls':user_id_urls,
+            'url':remove_nulls(tweet['user']['url']),
             'description':remove_nulls(tweet['user']['description']),
             'protected':tweet['user']['protected'],
             'verified':tweet['user']['verified'],
@@ -234,7 +202,6 @@ def _insert_tweets(connection,input_tweets):
         ########################################
 
         try:
-            geo_coords = tweet['geo']['coordinates']
             geo_coords = str(tweet['geo']['coordinates'][0]) + ' ' + str(tweet['geo']['coordinates'][1])
             geo_str = 'POINT'
         except TypeError:
@@ -250,10 +217,9 @@ def _insert_tweets(connection,input_tweets):
                     geo_coords+=')'
                 geo_coords+=')'
                 geo_str = 'MULTIPOLYGON'
-            except KeyError:
-                if tweet['user']['geo_enabled']:
-                    geo_str = None
-                    geo_coords = None
+            except (TypeError, KeyError):
+                geo_str = None
+                geo_coords = None
 
         try:
             text = tweet['extended_tweet']['full_text']
@@ -277,12 +243,7 @@ def _insert_tweets(connection,input_tweets):
         except TypeError:
             place_name = None
 
-        # NOTE:
-        # The tweets table has the following foreign key:
-        # > FOREIGN KEY (in_reply_to_user_id) REFERENCES users(id_users)
-        #
-        # This means that every "in_reply_to_user_id" field must reference a valid entry in the users table.
-        # If the id is not in the users table, then you'll need to add it in an "unhydrated" form.
+        # Keep a partial user observation for a reply target.
         if tweet.get('in_reply_to_user_id',None) is not None:
             users_unhydrated_from_tweets.append({
                 'id_users':tweet['in_reply_to_user_id'],
@@ -322,10 +283,12 @@ def _insert_tweets(connection,input_tweets):
             urls = tweet['entities']['urls']
 
         for url in urls:
-            id_urls = get_id_urls(url['expanded_url'])
+            expanded_url = url.get('expanded_url') or url.get('url')
+            if expanded_url is None:
+                continue
             tweet_urls.append({
                 'id_tweets':tweet['id'],
-                'id_urls':id_urls,
+                'url':remove_nulls(expanded_url),
                 })
 
         ########################################
@@ -381,26 +344,16 @@ def _insert_tweets(connection,input_tweets):
                 media = []
 
         for medium in media:
-            id_urls = get_id_urls(medium['media_url'])
             tweet_media.append({
                 'id_tweets':tweet['id'],
-                'id_urls':id_urls,
+                'url':remove_nulls(medium['media_url']),
                 'type':medium['type']
                 })
 
     ######################################## 
     # STEP 2: perform the actual SQL inserts
     ######################################## 
-    with connection.begin() as trans:
-
-        # use the bulk_insert function to insert most of the data
-        bulk_insert(connection, 'users', users)
-        bulk_insert(connection, 'users', users_unhydrated_from_tweets)
-        bulk_insert(connection, 'users', users_unhydrated_from_mentions)
-        bulk_insert(connection, 'tweet_mentions', tweet_mentions)
-        bulk_insert(connection, 'tweet_tags', tweet_tags)
-        bulk_insert(connection, 'tweet_media', tweet_media)
-        bulk_insert(connection, 'tweet_urls', tweet_urls)
+    with connection.begin():
 
         # the tweets data cannot be inserted using the bulk_insert function because
         # the geo column requires special SQL code to generate the column;
@@ -422,7 +375,21 @@ def _insert_tweets(connection,input_tweets):
             ON CONFLICT DO NOTHING
             '''
             )
-        res = connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
+        tweets.sort(key=lambda row: row['id_tweets'])
+        connection.execute(sql, { key+str(i):value for i,tweet in enumerate(tweets) for key,value in tweet.items() })
+
+        # use the bulk_insert function to insert most of the data
+        bulk_insert(connection, 'user_observations', users)
+        bulk_insert(connection, 'user_observations', users_unhydrated_from_tweets)
+        bulk_insert(connection, 'user_observations', users_unhydrated_from_mentions)
+        tweet_mentions.sort(key=lambda row: (row['id_tweets'], row['id_users']))
+        bulk_insert(connection, 'tweet_mentions', tweet_mentions)
+        tweet_tags.sort(key=lambda row: (row['id_tweets'], row['tag']))
+        bulk_insert(connection, 'tweet_tags', tweet_tags)
+        tweet_media.sort(key=lambda row: (row['id_tweets'], row['url']))
+        bulk_insert(connection, 'tweet_media', tweet_media)
+        tweet_urls.sort(key=lambda row: (row['id_tweets'], row['url']))
+        bulk_insert(connection, 'tweet_urls', tweet_urls)
 
 
 if __name__ == '__main__':
@@ -445,14 +412,13 @@ if __name__ == '__main__':
     # NOTE:
     # we reverse sort the filenames because this results in fewer updates to the users table,
     # which prevents excessive dead tuples and autovacuums
-    with connection.begin() as trans:
-        for filename in sorted(args.inputs, reverse=True):
-            with zipfile.ZipFile(filename, 'r') as archive: 
-                print(datetime.datetime.now(),filename)
-                for subfilename in sorted(archive.namelist(), reverse=True):
-                    with io.TextIOWrapper(archive.open(subfilename)) as f:
-                        tweets = []
-                        for i,line in enumerate(f):
-                            tweet = json.loads(line)
-                            tweets.append(tweet)
-                        insert_tweets(connection,tweets,args.batch_size)
+    for filename in sorted(args.inputs, reverse=True):
+        with zipfile.ZipFile(filename, 'r') as archive:
+            print(datetime.datetime.now(),filename)
+            for subfilename in sorted(archive.namelist(), reverse=True):
+                with io.TextIOWrapper(archive.open(subfilename)) as f:
+                    tweets = []
+                    for i,line in enumerate(f):
+                        tweet = json.loads(line)
+                        tweets.append(tweet)
+                    insert_tweets(connection,tweets,args.batch_size)
